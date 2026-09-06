@@ -297,146 +297,60 @@ async def ensure_auth(client: Optional[DataMinerClient]) -> DataMinerClient:
     return client
 
 
-def farm_loop(
-    client: DataMinerClient,
-    do_upgrade: bool = False,
-    claim_interval: int = 3600,
-) -> None:
-    """
-    Continuous auto-tap.
-
-    Tap berjalan terus menerus secara lokal.
-    Claim dilakukan setiap `claim_interval` detik.
-
-    Default:
-        3600 detik = 1 jam
-    """
-
-    log.info(
-        "starting continuous auto-tap — claim every %s seconds (%.1f minutes)",
-        claim_interval,
-        claim_interval / 60,
-    )
-
-    tap_count = 0
-    last_claim = time.monotonic()
-    last_status = time.monotonic()
+async def farm_loop(client, do_upgrade=True, claim_interval=3600):
+    last_claim = time.time()
 
     while True:
         try:
-            # --------------------------------------------------------- #
-            # Continuous tap
-            # --------------------------------------------------------- #
+            auth_data = client.auth()
 
-            tap_count += 1
 
-            # Setiap tap = 0.0005
-            mined = tap_count * client.TAP_VALUE
+            user = auth_data.get("user", {})
+            balance = float(user.get("miningBalance", 0))
+            level = user.get("level", 0)
+            hashrate = user.get("hashrate", 0)
 
-            # --------------------------------------------------------- #
-            # Status setiap 10 detik
-            # --------------------------------------------------------- #
+            now = time.time()
 
-            now = time.monotonic()
-
-            if now - last_status >= 10:
-                elapsed = now - last_claim
-                remaining = max(0, claim_interval - elapsed)
-
-                log.info(
-                    "auto-tap: %s taps | %.6f COIN | claim in %.0fs",
-                    tap_count,
-                    mined,
-                    remaining,
-                )
-
-                last_status = now
-
-            # --------------------------------------------------------- #
-            # Claim setiap 1 jam
-            # --------------------------------------------------------- #
-
+            # Claim berkala
             if now - last_claim >= claim_interval:
+                mined = float(auth_data.get("minedAmount", 0))
 
-                log.info(
-                    "1 hour reached — claiming %s taps = %.6f COIN",
-                    tap_count,
-                    mined,
-                )
+                if mined > 0:
+                    log.info(f"Claim mining: {mined}")
 
-                # Claim hasil auto-tap
-                if tap_count > 0:
-                    res = client.claim_taps(tap_count)
+                    result = client.claim_mining(mined)
 
-                    log.info(
-                        "tap claim: %s | taps=%s | amount=%.6f",
-                        res.get("message", "ok"),
-                        tap_count,
-                        mined,
-                    )
+                    log.info(f"Claim result: {result}")
 
-                # Reset counter setelah claim
-                tap_count = 0
-                last_claim = time.monotonic()
+                    last_claim = now
 
-                # ----------------------------------------------------- #
-                # Refresh auth setelah claim
-                # ----------------------------------------------------- #
+                    # Refresh data setelah claim
+                    auth_data = client.auth()
 
-                auth = client.auth()
+                    balance = float(auth_data.get("balance", 0))
+                    level = auth_data.get("level", 0)
+                    hashrate = auth_data.get("hashrate", 0)
 
-                if not auth.get("success"):
-                    log.warning(
-                        "auth failed after claim: %s",
-                        auth.get("message"),
-                    )
-                    time.sleep(5)
-                    continue
+            # Auto upgrade
+            if do_upgrade and balance > 0:
+                result = client.upgrade_level()
 
-                user = auth.get("user", {})
-                settings = auth.get("settings", {})
-                coin = settings.get("coinSymbol", "COIN")
+                if result:
+                    log.info(f"Auto upgrade: {result}")
 
-                log.info(
-                    "balance=%s %s | level=%s | hashrate=%s",
-                    user.get("miningBalance"),
-                    coin,
-                    user.get("level"),
-                    user.get("hashrate"),
-                )
+            log.info(
+                f"Balance={balance} | "
+                f"Level={level} | "
+                f"Hashrate={hashrate}"
+            )
 
-                # ----------------------------------------------------- #
-                # Optional upgrade
-                # ----------------------------------------------------- #
+            await asyncio.sleep(1)
 
-                if do_upgrade:
-                    bal = float(user.get("miningBalance") or 0)
+        except Exception as e:
+            log.error(f"Farm error: {e}")
+            await asyncio.sleep(10)
 
-                    if bal > 0:
-                        res = client.upgrade_level()
-
-                        log.info(
-                            "upgrade-level: %s",
-                            res.get("message", "ok"),
-                        )
-
-            # --------------------------------------------------------- #
-            # Tiny yield supaya CPU tidak 100%
-            # --------------------------------------------------------- #
-
-            time.sleep(0.001)
-
-        except KeyboardInterrupt:
-            log.info("stopped by user")
-            break
-
-        except RuntimeError as exc:
-            log.error("%s — retry in 10s", exc)
-            time.sleep(10)
-
-        except Exception as exc:
-            log.exception("unexpected error: %s — retry in 10s", exc)
-            time.sleep(10)
 
 # --------------------------------------------------------------------------- #
 # CLI
@@ -453,7 +367,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--no-upgrade", action="store_true", help="skip level upgrades")
     p.add_argument("--tap", action="store_true", help="single auto-tap burst, then exit (use with --taps)")
     p.add_argument("--taps", type=int, default=0, metavar="N",
-                   help="taps per round (each tap = 0.0005 mined). 0 disables auto-tap.")
+                   help="taps per round (each tap = 0.0005 mined). 0 disables auto-tap."),
+    p.add_argument("--no-taps", action="store_true", help="disable auto-tap (default: enabled)")
+
     args = p.parse_args(argv)
 
     if args.phone:
@@ -466,11 +382,15 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if args.run:
         client = asyncio.run(ensure_auth(_load_cached()))
-        farm_loop(
-            client,
-            do_upgrade=not args.no_upgrade,
-            claim_interval=3600,
+
+        asyncio.run(
+            farm_loop(
+                client,
+                do_upgrade=not args.no_upgrade,
+                claim_interval=3600,
+            )
         )
+
         return 0
 
     # if args.tap:
@@ -502,10 +422,12 @@ def main(argv: Optional[list[str]] = None) -> int:
                 )
             )
 
-            farm_loop(
-                client,
-                do_upgrade=not args.no_upgrade,
-                claim_interval=3600,
+            asyncio.run(
+                farm_loop(
+                    client,
+                    do_upgrade=not args.no_upgrade,
+                    claim_interval=3600,
+                )
             )
 
         return 0
